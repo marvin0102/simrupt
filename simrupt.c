@@ -51,11 +51,11 @@ static DEFINE_MUTEX(read_lock);
 static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 
 /* Generate new data from the simulated device */
-static inline int update_simrupt_data(void)
-{
-    simrupt_data = max((simrupt_data + 1) % 0x7f, 0x20);
-    return simrupt_data;
-}
+// static inline int update_simrupt_data(void)
+// {
+//     simrupt_data = max((simrupt_data + 1) % 0x7f, 0x20);
+//     return simrupt_data;
+// }
 
 /* Insert a value into the kfifo buffer */
 static void produce_data(unsigned char val)
@@ -212,9 +212,13 @@ static DECLARE_TASKLET_OLD(simrupt_tasklet, simrupt_tasklet_func);
 static void process_data(void)
 {
     WARN_ON_ONCE(!irqs_disabled());
-
+    char *tmp =
+        "   |   |   \n------------\n   |   |   \n------------\n   |   |   \n";
+    int len = strlen(tmp);
     pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-    fast_buf_put(update_simrupt_data());
+    for (int i = 0; i < len; i++) {
+        fast_buf_put(tmp[i]);
+    }
 
     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
     tasklet_schedule(&simrupt_tasklet);
