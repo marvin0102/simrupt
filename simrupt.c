@@ -10,6 +10,8 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
+#include "game.h"
+
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("A device that simulates interrupts");
@@ -38,6 +40,11 @@ static int major;
 static struct class *simrupt_class;
 static struct cdev simrupt_cdev;
 
+/* Game board*/
+static char table[N_GRIDS];
+#define BOARD_GRIDS 2 * 4 * (N_GRIDS + 1) + 2
+static char board_buff[BOARD_GRIDS];
+
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
 
@@ -51,21 +58,22 @@ static DEFINE_MUTEX(read_lock);
 static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 
 /* Generate new data from the simulated device */
-// static inline int update_simrupt_data(void)
-// {
-//     simrupt_data = max((simrupt_data + 1) % 0x7f, 0x20);
-//     return simrupt_data;
-// }
+static inline char *update_simrupt_data(void)
+{
+    simrupt_data = max((simrupt_data + 1) % 16, 0);
+    table[simrupt_data] = 'O';
+    return table;
+}
 
 /* Insert a value into the kfifo buffer */
-static void produce_data(unsigned char val)
+static void produce_data(void)
 {
     /* Implement a kind of circular FIFO here (skip oldest element if kfifo
      * buffer is full).
      */
-    unsigned int len = kfifo_in(&rx_fifo, &val, sizeof(val));
-    if (unlikely(len < sizeof(val)) && printk_ratelimit())
-        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(val) - len);
+    unsigned int len = kfifo_in(&rx_fifo, board_buff, sizeof(board_buff));
+    if (unlikely(len < sizeof(board_buff)) && printk_ratelimit())
+        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(board_buff) - len);
 
     pr_debug("simrupt: %s: in %u/%u bytes\n", __func__, len,
              kfifo_len(&rx_fifo));
@@ -79,70 +87,50 @@ static DEFINE_MUTEX(producer_lock);
  */
 static DEFINE_MUTEX(consumer_lock);
 
-/* We use an additional "faster" circular buffer to quickly store data from
- * interrupt context, before adding them to the kfifo.
- */
-static struct circ_buf fast_buf;
 
-static int fast_buf_get(void)
+static int draw_board(const char *t)
 {
-    struct circ_buf *ring = &fast_buf;
-
-    /* prevent the compiler from merging or refetching accesses for tail */
-    unsigned long head = READ_ONCE(ring->head), tail = ring->tail;
-    int ret;
-
-    if (unlikely(!CIRC_CNT(head, tail, PAGE_SIZE)))
-        return -ENOENT;
-
-    /* read index before reading contents at that index */
-    smp_rmb();
-
-    /* extract item from the buffer */
-    ret = ring->buf[tail];
-
-    /* finish reading descriptor before incrementing tail */
-    smp_mb();
-
-    /* increment the tail pointer */
-    ring->tail = (tail + 1) & (PAGE_SIZE - 1);
-
-    return ret;
-}
-
-static int fast_buf_put(unsigned char val)
-{
-    struct circ_buf *ring = &fast_buf;
-    unsigned long head = ring->head;
-
-    /* prevent the compiler from merging or refetching accesses for tail */
-    unsigned long tail = READ_ONCE(ring->tail);
-
-    /* is circular buffer full? */
-    if (unlikely(!CIRC_SPACE(head, tail, PAGE_SIZE)))
-        return -ENOMEM;
-
-    ring->buf[ring->head] = val;
-
-    /* commit the item before incrementing the head */
+    int i = 0;
+    board_buff[i++] = '\n';
     smp_wmb();
-
-    /* update header pointer */
-    ring->head = (ring->head + 1) & (PAGE_SIZE - 1);
+    board_buff[i++] = '\n';
+    smp_wmb();
+    for (int x = 0; x < BOARD_SIZE; x++) {
+        for (int y = 0; y < BOARD_SIZE; y++) {
+            board_buff[i++] = ' ';
+            smp_wmb();
+            WRITE_ONCE(board_buff[i++], table[GET_INDEX(x, y)]);
+            smp_wmb();
+            board_buff[i++] = ' ';
+            smp_wmb();
+            if (y != BOARD_SIZE - 1) {
+                board_buff[i++] = '|';
+                smp_wmb();
+            }
+        }
+        board_buff[i++] = '\n';
+        smp_wmb();
+        for (int y = 0; y < BOARD_SIZE; y++) {
+            board_buff[i++] = '-';
+            smp_wmb();
+            board_buff[i++] = '-';
+            smp_wmb();
+            board_buff[i++] = '-';
+            smp_wmb();
+            board_buff[i++] = '-';
+            smp_wmb();
+        }
+        board_buff[i++] = '\n';
+        smp_wmb();
+    }
 
     return 0;
-}
-
-/* Clear all data from the circular buffer fast_buf */
-static void fast_buf_clear(void)
-{
-    fast_buf.head = fast_buf.tail = 0;
 }
 
 /* Workqueue handler: executed by a kernel thread */
 static void simrupt_work_func(struct work_struct *w)
 {
-    int val, cpu;
+    int cpu;
 
     /* This code runs from a kernel thread, so softirqs and hard-irqs must
      * be enabled.
@@ -157,20 +145,20 @@ static void simrupt_work_func(struct work_struct *w)
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
 
-    while (1) {
-        /* Consume data from the circular buffer */
-        mutex_lock(&consumer_lock);
-        val = fast_buf_get();
-        mutex_unlock(&consumer_lock);
+    // while (1) {
+    //     /* Consume data from the circular buffer */
+    //     mutex_lock(&consumer_lock);
+    //     val = fast_buf_get();
+    //     mutex_unlock(&consumer_lock);
 
-        if (val < 0)
-            break;
+    //     if (val < 0)
+    //         break;
 
-        /* Store data to the kfifo buffer */
-        mutex_lock(&producer_lock);
-        produce_data(val);
-        mutex_unlock(&producer_lock);
-    }
+    //     /* Store data to the kfifo buffer */
+    mutex_lock(&producer_lock);
+    produce_data();
+    mutex_unlock(&producer_lock);
+    // }
     wake_up_interruptible(&rx_wait);
 }
 
@@ -212,14 +200,8 @@ static DECLARE_TASKLET_OLD(simrupt_tasklet, simrupt_tasklet_func);
 static void process_data(void)
 {
     WARN_ON_ONCE(!irqs_disabled());
-    char *tmp =
-        "   |   |   \n------------\n   |   |   \n------------\n   |   |   \n";
-    int len = strlen(tmp);
     pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-    for (int i = 0; i < len; i++) {
-        fast_buf_put(tmp[i]);
-    }
-
+    draw_board(update_simrupt_data());
     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
     tasklet_schedule(&simrupt_tasklet);
 }
@@ -305,7 +287,7 @@ static int simrupt_release(struct inode *inode, struct file *filp)
     if (atomic_dec_and_test(&open_cnt) == 0) {
         del_timer_sync(&timer);
         flush_workqueue(simrupt_workqueue);
-        fast_buf_clear();
+        // fast_buf_clear();
     }
     pr_info("release, current cnt: %d\n", atomic_read(&open_cnt));
 
@@ -358,18 +340,18 @@ static int __init simrupt_init(void)
     device_create(simrupt_class, NULL, MKDEV(major, 0), NULL, DEV_NAME);
 
     /* Allocate fast circular buffer */
-    fast_buf.buf = vmalloc(PAGE_SIZE);
-    if (!fast_buf.buf) {
-        device_destroy(simrupt_class, dev_id);
-        class_destroy(simrupt_class);
-        ret = -ENOMEM;
-        goto error_cdev;
-    }
+    // fast_buf.buf = vmalloc(PAGE_SIZE);
+    // if (!fast_buf.buf) {
+    //     device_destroy(simrupt_class, dev_id);
+    //     class_destroy(simrupt_class);
+    //     ret = -ENOMEM;
+    //     goto error_cdev;
+    // }
 
     /* Create the workqueue */
     simrupt_workqueue = alloc_workqueue("simruptd", WQ_UNBOUND, WQ_MAX_ACTIVE);
     if (!simrupt_workqueue) {
-        vfree(fast_buf.buf);
+        // vfree(fast_buf.buf);
         device_destroy(simrupt_class, dev_id);
         class_destroy(simrupt_class);
         ret = -ENOMEM;
@@ -379,6 +361,11 @@ static int __init simrupt_init(void)
     /* Setup the timer */
     timer_setup(&timer, timer_handler, 0);
     atomic_set(&open_cnt, 0);
+
+    /* init game table */
+    for (int i = 0; i < N_GRIDS; i++) {
+        table[i] = ' ';
+    }
 
     pr_info("simrupt: registered new simrupt device: %d,%d\n", major, 0);
 out:
@@ -400,7 +387,7 @@ static void __exit simrupt_exit(void)
     tasklet_kill(&simrupt_tasklet);
     flush_workqueue(simrupt_workqueue);
     destroy_workqueue(simrupt_workqueue);
-    vfree(fast_buf.buf);
+    // vfree(fast_buf.buf);
     device_destroy(simrupt_class, dev_id);
     class_destroy(simrupt_class);
     cdev_del(&simrupt_cdev);

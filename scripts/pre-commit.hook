@@ -3,7 +3,8 @@
 CPPCHECK_suppresses="--suppress=unmatchedSuppression \
 --suppress=missingIncludeSystem -i ksort.mod.c --suppress=variableScope \
 --suppress=constParameterPointer:simrupt.c \
---suppress=constParameterCallback:simrupt.c"
+--suppress=constParameterCallback:simrupt.c \
+--suppress=unmatchedSuppression:simrupt.c"
 CPPCHECK_OPTS="-I. --enable=all --error-exitcode=1 --force $CPPCHECK_suppresses ."
 
 RETURN=0
