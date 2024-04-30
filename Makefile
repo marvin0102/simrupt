@@ -1,5 +1,5 @@
-NAME = kmldrv
-kmldrv-objs = simrupt.o game.o mcts.o 
+NAME = tttkml
+tttkml-objs = simrupt.o game.o mcts.o 
 obj-m := $(NAME).o 
 
 KDIR ?= /lib/modules/$(shell uname -r)/build

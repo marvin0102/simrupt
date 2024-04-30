@@ -13,7 +13,7 @@
         if (table[i] == ' ')
 
 #define Q 8
-typedef int Q23_8;
+typedef unsigned int Q23_8;
 
 typedef struct {
     int i_shift, j_shift;

@@ -45,6 +45,7 @@ static struct cdev simrupt_cdev;
 static char table[N_GRIDS];
 #define BOARD_GRIDS 2 * 4 * (N_GRIDS + 1) + 2
 static char board_buff[BOARD_GRIDS];
+char turn;
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -57,6 +58,7 @@ static DEFINE_MUTEX(read_lock);
 
 /* Wait queue to implement blocking I/O from userspace */
 static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
+static DECLARE_WAIT_QUEUE_HEAD(player_wait);
 
 /* Generate new data from the simulated device */
 static inline char *update_simrupt_data(void)
@@ -88,50 +90,55 @@ static DEFINE_MUTEX(producer_lock);
  */
 static DEFINE_MUTEX(consumer_lock);
 
-static void play_game(void)
+/* AI player task*/
+
+static void Player_I_task(struct work_struct *w)
 {
-    char turn = 'X';
-    char ai = 'O';
+    // if(turn != 'O') return;
+    /* This code runs from a kernel thread, so softirqs and hard-irqs must
+     * be enabled.
+     */
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+
     int move;
-    pr_info("------- play game ------");
-    while (1) {
-        mutex_lock(&consumer_lock);
-        char win = check_win(table);
-        mutex_unlock(&consumer_lock);
-        if (win == 'D') {
-            // draw_board(table);
-            // printf("It is a draw!\n");
-            break;
-        } else if (win != ' ') {
-            // draw_board(table);
-            // printf("%c won!\n", win);
-            break;
-        }
 
-        if (turn == ai) {
-            mutex_lock(&consumer_lock);
-            move = mcts(table, ai);
-            if (move != -1) {
-                table[move] = ai;
-                // record_move(move);
-            }
-            mutex_unlock(&consumer_lock);
-            pr_info("------- first ------");
-
-        } else {
-            mutex_lock(&consumer_lock);
-            move = mcts(table, turn);
-            if (move != -1) {
-                table[move] = turn;
-                // record_move(move);
-            }
-            mutex_unlock(&consumer_lock);
-            pr_info("------- second ------");
+    if (turn == 'O') {
+        move = mcts(table, turn);
+        if (move != -1) {
+            WRITE_ONCE(table[move], turn);
         }
-        turn = turn == 'X' ? 'O' : 'X';
+        WRITE_ONCE(turn, 'X');
     }
+    smp_wmb();
+
+    pr_info("------- first ------");
+    pr_info("simrupt: [CPU#%d] player I game\n", smp_processor_id());
 }
 
+static void Player_II_task(struct work_struct *w)
+{
+    // if(turn != 'O') return;
+    /* This code runs from a kernel thread, so softirqs and hard-irqs must
+     * be enabled.
+     */
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+
+    int move;
+
+    if (turn == 'X') {
+        move = mcts(table, turn);
+        if (move != -1) {
+            WRITE_ONCE(table[move], turn);
+        }
+        WRITE_ONCE(turn, 'O');
+    }
+    smp_wmb();
+
+    pr_info("------- second ------");
+    pr_info("simrupt: [CPU#%d] player I game\n", smp_processor_id());
+}
 
 static int draw_board(const char *t)
 {
@@ -204,6 +211,8 @@ static struct workqueue_struct *simrupt_workqueue;
  * asynchronously.
  */
 static DECLARE_WORK(work, simrupt_work_func);
+static DECLARE_WORK(player1, Player_I_task);
+static DECLARE_WORK(player2, Player_II_task);
 
 /* Tasklet handler.
  *
@@ -227,6 +236,55 @@ static void simrupt_tasklet_func(unsigned long __data)
 
     pr_info("simrupt: [CPU#%d] %s in_softirq: %llu usec\n", smp_processor_id(),
             __func__, (unsigned long long) nsecs >> 10);
+}
+
+/* AI player task*/
+static void play_game(void)
+{
+    // char turn = 'X';
+    // char ai = 'O';
+    // int move;
+    // pr_info("------- play game ------");
+    // while (1) {
+    //     mutex_lock(&consumer_lock);
+    //     char win = check_win(table);
+    //     mutex_unlock(&consumer_lock);
+    //     if (win == 'D') {
+    //         // draw_board(table);
+    //         // printf("It is a draw!\n");
+    //         break;
+    //     } else if (win != ' ') {
+    //         // draw_board(table);
+    //         // printf("%c won!\n", win);
+    //         break;
+    //     }
+
+    //     if (turn == ai) {
+    //         mutex_lock(&consumer_lock);
+    //         move = mcts(table, ai);
+    //         if (move != -1) {
+    //             table[move] = ai;
+    //             // record_move(move);
+    //         }
+    //         mutex_unlock(&consumer_lock);
+    //         pr_info("------- first ------");
+
+    //     } else {
+    //         mutex_lock(&consumer_lock);
+    //         move = mcts(table, turn);
+    //         if (move != -1) {
+    //             table[move] = turn;
+    //             // record_move(move);
+    //         }
+    //         mutex_unlock(&consumer_lock);
+    //         pr_info("------- second ------");
+    //     }
+    //     turn = turn == 'X' ? 'O' : 'X';
+    // }
+    pr_info("------- enter first ------");
+    queue_work(simrupt_workqueue, &player1);
+    pr_info("------- enter second ------");
+    queue_work(simrupt_workqueue, &player2);
 }
 
 /* Tasklet for asynchronous bottom-half processing in softirq context */
@@ -256,6 +314,13 @@ static void timer_handler(struct timer_list *__timer)
     local_irq_disable();
 
     tv_start = ktime_get();
+    // process_data();
+    mutex_lock(&consumer_lock);
+    char win = check_win(table);
+    mutex_unlock(&consumer_lock);
+    if (win == ' ') {
+        play_game();
+    }
     process_data();
     tv_end = ktime_get();
 
@@ -312,7 +377,7 @@ static int simrupt_open(struct inode *inode, struct file *filp)
     if (atomic_inc_return(&open_cnt) == 1)
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     pr_info("openm current cnt: %d\n", atomic_read(&open_cnt));
-    play_game();
+    // play_game();
 
     return 0;
 }
@@ -392,6 +457,7 @@ static int __init simrupt_init(void)
     for (int i = 0; i < N_GRIDS; i++) {
         table[i] = ' ';
     }
+    turn = 'O';
 
     pr_info("simrupt: registered new simrupt device: %d,%d\n", major, 0);
 out:

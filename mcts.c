@@ -58,15 +58,13 @@ Q23_8 fixed_div(Q23_8 a, Q23_8 b)
 {
     /* pre-multiply by the base (Upscale to Q16 so that the result will be in Q8
      * format) */
-    long long temp = (long long) a << Q;
+    unsigned long temp = (unsigned long) a << Q;
     /* Rounding: mid values are rounded up (down for negative values). */
     /* OR compare most significant bits i.e. if (((temp >> 31) & 1) == ((b >>
      * 15) & 1)) */
-    if ((temp >= 0 && b >= 0) || (temp < 0 && b < 0)) {
-        temp += b / 2; /* OR shift 1 bit i.e. temp += (b >> 1); */
-    } else {
-        temp -= b / 2; /* OR shift 1 bit i.e. temp -= (b >> 1); */
-    }
+
+    temp += b / 2; /* OR shift 1 bit i.e. temp += (b >> 1); */
+
     return (Q23_8) (temp / b);
 }
 
@@ -86,7 +84,7 @@ Q23_8 fixed_log(int input)
             return Rlog;
         log = fixed_div(Llog + Rlog, 2 << Q);
 
-        long long tmp = ((long long) L * (long long) R) >> Q;
+        unsigned long tmp = ((unsigned long) L * (unsigned long) R) >> Q;
         tmp = fixed_sqrt((Q23_8) tmp);
 
         if (y >= tmp) {
@@ -106,8 +104,9 @@ static inline Q23_8 uct_score(int n_total, int n_visits, Q23_8 score)
     if (n_visits == 0)
         return 0xffffffff;
     Q23_8 result = score << Q / (Q23_8) (n_visits << Q);
-    long long tmp = (long long) EXPLORATION_FACTOR *
-                    (long long) fixed_sqrt(fixed_log(n_total) / n_visits);
+    unsigned long tmp =
+        (unsigned long) EXPLORATION_FACTOR *
+        (unsigned long) fixed_sqrt(fixed_log(n_total) / n_visits);
     Q23_8 resultN = tmp >> Q;
     return result + resultN;
 }
