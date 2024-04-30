@@ -1,5 +1,6 @@
-NAME = simrupt
-obj-m := $(NAME).o
+NAME = kmldrv
+kmldrv-objs = simrupt.o game.o mcts.o 
+obj-m := $(NAME).o 
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

@@ -11,6 +11,7 @@
 #include <linux/workqueue.h>
 
 #include "game.h"
+#include "mcts.h"
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -60,8 +61,8 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Generate new data from the simulated device */
 static inline char *update_simrupt_data(void)
 {
-    simrupt_data = max((simrupt_data + 1) % 16, 0);
-    table[simrupt_data] = 'O';
+    // simrupt_data = max((simrupt_data + 1) % 16, 0);
+    // table[simrupt_data] = 'O';
     return table;
 }
 
@@ -86,6 +87,50 @@ static DEFINE_MUTEX(producer_lock);
  * run in workqueue handler (kernel thread context).
  */
 static DEFINE_MUTEX(consumer_lock);
+
+static void play_game(void)
+{
+    char turn = 'X';
+    char ai = 'O';
+    int move;
+    pr_info("------- play game ------");
+    while (1) {
+        mutex_lock(&consumer_lock);
+        char win = check_win(table);
+        mutex_unlock(&consumer_lock);
+        if (win == 'D') {
+            // draw_board(table);
+            // printf("It is a draw!\n");
+            break;
+        } else if (win != ' ') {
+            // draw_board(table);
+            // printf("%c won!\n", win);
+            break;
+        }
+
+        if (turn == ai) {
+            mutex_lock(&consumer_lock);
+            move = mcts(table, ai);
+            if (move != -1) {
+                table[move] = ai;
+                // record_move(move);
+            }
+            mutex_unlock(&consumer_lock);
+            pr_info("------- first ------");
+
+        } else {
+            mutex_lock(&consumer_lock);
+            move = mcts(table, turn);
+            if (move != -1) {
+                table[move] = turn;
+                // record_move(move);
+            }
+            mutex_unlock(&consumer_lock);
+            pr_info("------- second ------");
+        }
+        turn = turn == 'X' ? 'O' : 'X';
+    }
+}
 
 
 static int draw_board(const char *t)
@@ -145,20 +190,10 @@ static void simrupt_work_func(struct work_struct *w)
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
 
-    // while (1) {
-    //     /* Consume data from the circular buffer */
-    //     mutex_lock(&consumer_lock);
-    //     val = fast_buf_get();
-    //     mutex_unlock(&consumer_lock);
-
-    //     if (val < 0)
-    //         break;
-
-    //     /* Store data to the kfifo buffer */
     mutex_lock(&producer_lock);
     produce_data();
     mutex_unlock(&producer_lock);
-    // }
+
     wake_up_interruptible(&rx_wait);
 }
 
@@ -277,6 +312,7 @@ static int simrupt_open(struct inode *inode, struct file *filp)
     if (atomic_inc_return(&open_cnt) == 1)
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     pr_info("openm current cnt: %d\n", atomic_read(&open_cnt));
+    play_game();
 
     return 0;
 }
@@ -287,7 +323,6 @@ static int simrupt_release(struct inode *inode, struct file *filp)
     if (atomic_dec_and_test(&open_cnt) == 0) {
         del_timer_sync(&timer);
         flush_workqueue(simrupt_workqueue);
-        // fast_buf_clear();
     }
     pr_info("release, current cnt: %d\n", atomic_read(&open_cnt));
 
@@ -339,19 +374,10 @@ static int __init simrupt_init(void)
     /* Register the device with sysfs */
     device_create(simrupt_class, NULL, MKDEV(major, 0), NULL, DEV_NAME);
 
-    /* Allocate fast circular buffer */
-    // fast_buf.buf = vmalloc(PAGE_SIZE);
-    // if (!fast_buf.buf) {
-    //     device_destroy(simrupt_class, dev_id);
-    //     class_destroy(simrupt_class);
-    //     ret = -ENOMEM;
-    //     goto error_cdev;
-    // }
 
     /* Create the workqueue */
     simrupt_workqueue = alloc_workqueue("simruptd", WQ_UNBOUND, WQ_MAX_ACTIVE);
     if (!simrupt_workqueue) {
-        // vfree(fast_buf.buf);
         device_destroy(simrupt_class, dev_id);
         class_destroy(simrupt_class);
         ret = -ENOMEM;
@@ -387,7 +413,6 @@ static void __exit simrupt_exit(void)
     tasklet_kill(&simrupt_tasklet);
     flush_workqueue(simrupt_workqueue);
     destroy_workqueue(simrupt_workqueue);
-    // vfree(fast_buf.buf);
     device_destroy(simrupt_class, dev_id);
     class_destroy(simrupt_class);
     cdev_del(&simrupt_cdev);
