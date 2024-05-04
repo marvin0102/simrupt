@@ -1,5 +1,5 @@
 NAME = tttkml
-tttkml-objs = simrupt.o game.o mcts.o 
+tttkml-objs = simrupt.o game.o mcts.o mt19937-64.o zobrist.o negamax.o
 obj-m := $(NAME).o 
 
 KDIR ?= /lib/modules/$(shell uname -r)/build

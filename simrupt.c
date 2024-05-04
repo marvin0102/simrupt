@@ -14,6 +14,7 @@
 #include "chardev.h"
 #include "game.h"
 #include "mcts.h"
+#include "negamax.h"
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
@@ -67,14 +68,6 @@ static DEFINE_MUTEX(read_lock);
 static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 static DECLARE_WAIT_QUEUE_HEAD(player_wait);
 
-/* Generate new data from the simulated device */
-static inline char *update_simrupt_data(void)
-{
-    // simrupt_data = max((simrupt_data + 1) % 16, 0);
-    // table[simrupt_data] = 'O';
-    return table;
-}
-
 /* Insert a value into the kfifo buffer */
 static void produce_data(void)
 {
@@ -96,14 +89,15 @@ static DEFINE_MUTEX(producer_lock);
  * run in workqueue handler (kernel thread context).
  */
 static DEFINE_MUTEX(consumer_lock);
+static DEFINE_MUTEX(playerI_lock);
+static DEFINE_MUTEX(playerII_lock);
 
 
 
-static int draw_board(const char *t)
+static int draw_board(void)
 {
     int i = 0;
     board_buff[i++] = '\n';
-    smp_wmb();
     board_buff[i++] = '\n';
     smp_wmb();
     for (int x = 0; x < BOARD_SIZE; x++) {
@@ -123,11 +117,8 @@ static int draw_board(const char *t)
         smp_wmb();
         for (int y = 0; y < BOARD_SIZE; y++) {
             board_buff[i++] = '-';
-            smp_wmb();
             board_buff[i++] = '-';
-            smp_wmb();
             board_buff[i++] = '-';
-            smp_wmb();
             board_buff[i++] = '-';
             smp_wmb();
         }
@@ -155,6 +146,13 @@ static void simrupt_work_func(struct work_struct *w)
     cpu = get_cpu();
     pr_info("simrupt: [CPU#%d] %s\n", cpu, __func__);
     put_cpu();
+
+    pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
+
+    mutex_lock(&consumer_lock);
+    if (message[0] != 'p')
+        draw_board();
+    mutex_unlock(&consumer_lock);
 
     mutex_lock(&producer_lock);
     produce_data();
@@ -201,9 +199,6 @@ static DECLARE_TASKLET_OLD(simrupt_tasklet, simrupt_tasklet_func);
 static void process_data(void)
 {
     WARN_ON_ONCE(!irqs_disabled());
-    pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-    if (message[0] != 'p')
-        draw_board(update_simrupt_data());
     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
     tasklet_schedule(&simrupt_tasklet);
 }
@@ -220,17 +215,20 @@ static void Player_I_task(struct work_struct *w)
     WARN_ON_ONCE(in_interrupt());
 
     int move;
+    char ai = 'O';
     while (check_win(table) == ' ') {
-        if (turn == 'O') {
-            move = mcts(table, turn);
-            if (move != -1) {
-                WRITE_ONCE(table[move], turn);
-            }
-            WRITE_ONCE(turn, 'X');
-            pr_info("simrupt: [CPU#%d] -------- player I game\n",
-                    smp_processor_id());
-            smp_wmb();
+        mutex_lock(&playerI_lock);
+        mutex_lock(&consumer_lock);
+        move = mcts(table, ai);
+        if (move != -1) {
+            WRITE_ONCE(table[move], ai);
         }
+        // WRITE_ONCE(turn, 'X');
+        pr_info("simrupt: [CPU#%d] -------- player I game\n",
+                smp_processor_id());
+        smp_wmb();
+        mutex_unlock(&consumer_lock);
+        mutex_unlock(&playerII_lock);
     }
 }
 
@@ -244,17 +242,20 @@ static void Player_II_task(struct work_struct *w)
     WARN_ON_ONCE(in_interrupt());
 
     int move;
+    char ai = 'X';
     while (check_win(table) == ' ') {
-        if (turn == 'X') {
-            move = mcts(table, turn);
-            if (move != -1) {
-                WRITE_ONCE(table[move], turn);
-            }
-            WRITE_ONCE(turn, 'O');
-            pr_info("simrupt: [CPU#%d] -------- player II game\n",
-                    smp_processor_id());
-            smp_wmb();
+        mutex_lock(&playerII_lock);
+        mutex_lock(&consumer_lock);
+        move = negamax_predict(table, ai).move;
+        if (move != -1) {
+            WRITE_ONCE(table[move], ai);
         }
+        // WRITE_ONCE(turn, 'O');
+        pr_info("simrupt: [CPU#%d] -------- player II game\n",
+                smp_processor_id());
+        smp_wmb();
+        mutex_unlock(&consumer_lock);
+        mutex_unlock(&playerI_lock);
     }
 }
 
@@ -276,17 +277,13 @@ static void timer_handler(struct timer_list *__timer)
     local_irq_disable();
 
     tv_start = ktime_get();
-    // process_data();
-    mutex_lock(&consumer_lock);
     char win = check_win(table);
-    mutex_unlock(&consumer_lock);
     process_data();
     if (win != ' ') {
         pr_info("simrupt: %c win!!!", win);
         for (int i = 0; i < N_GRIDS; i++) {
             table[i] = ' ';
         }
-        turn = 'O';
         pr_info("------- enter first ------");
         queue_work(simrupt_workqueue, &player1);
         pr_info("------- enter second ------");
@@ -347,7 +344,7 @@ static int simrupt_open(struct inode *inode, struct file *filp)
     if (atomic_inc_return(&open_cnt) == 1)
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     pr_info("openm current cnt: %d\n", atomic_read(&open_cnt));
-
+    mutex_lock(&playerII_lock);
     pr_info("------- enter first ------");
     queue_work(simrupt_workqueue, &player1);
     pr_info("------- enter second ------");
@@ -405,7 +402,7 @@ static long device_ioctl(
         /* Give the current message to the calling process - the parameter
          * we got is a pointer, fill it.
          */
-        simrupt_read(file, (char __user *) ioctl_param, 150, &offset);
+        simrupt_read(file, (char __user *) ioctl_param, BOARD_GRIDS, &offset);
         break;
     }
     case IOCTL_GET_NTH_BYTE:
@@ -483,10 +480,10 @@ static int __init simrupt_init(void)
     atomic_set(&open_cnt, 0);
 
     /* init game table */
+    negamax_init();
     for (int i = 0; i < N_GRIDS; i++) {
         table[i] = ' ';
     }
-    turn = 'O';
     message[0] = 0;
 
     pr_info("simrupt: registered new simrupt device: %d,%d\n", major, 0);
