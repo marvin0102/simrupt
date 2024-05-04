@@ -1,5 +1,6 @@
 /* simrupt: A device that simulates interrupts */
 
+#include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/circ_buf.h>
 #include <linux/init.h>
@@ -10,6 +11,7 @@
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
+#include "chardev.h"
 #include "game.h"
 #include "mcts.h"
 
@@ -28,6 +30,8 @@ MODULE_DESCRIPTION("A device that simulates interrupts");
 
 #define NR_SIMRUPT 1
 
+#define SUCCESS 0
+
 static int delay = 100; /* time (in ms) to generate an event */
 
 /* Timer to simulate a periodic IRQ */
@@ -43,6 +47,12 @@ static char table[N_GRIDS];
 #define BOARD_GRIDS 2 * 4 * (N_GRIDS + 1) + 2
 static char board_buff[BOARD_GRIDS];
 char turn;
+
+/* Is the device open right now? Used to prevent concurrent access into
+ * the same device
+ */
+static atomic_t already_open = ATOMIC_INIT(CDEV_NOT_USED);
+static char message[BUF_LEN + 1];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -192,7 +202,8 @@ static void process_data(void)
 {
     WARN_ON_ONCE(!irqs_disabled());
     pr_info("simrupt: [CPU#%d] produce data\n", smp_processor_id());
-    draw_board(update_simrupt_data());
+    if (message[0] != 'p')
+        draw_board(update_simrupt_data());
     pr_info("simrupt: [CPU#%d] scheduling tasklet\n", smp_processor_id());
     tasklet_schedule(&simrupt_tasklet);
 }
@@ -219,7 +230,6 @@ static void Player_I_task(struct work_struct *w)
             pr_info("simrupt: [CPU#%d] -------- player I game\n",
                     smp_processor_id());
             smp_wmb();
-            process_data();
         }
     }
 }
@@ -244,7 +254,6 @@ static void Player_II_task(struct work_struct *w)
             pr_info("simrupt: [CPU#%d] -------- player II game\n",
                     smp_processor_id());
             smp_wmb();
-            process_data();
         }
     }
 }
@@ -271,8 +280,17 @@ static void timer_handler(struct timer_list *__timer)
     mutex_lock(&consumer_lock);
     char win = check_win(table);
     mutex_unlock(&consumer_lock);
+    process_data();
     if (win != ' ') {
         pr_info("simrupt: %c win!!!", win);
+        for (int i = 0; i < N_GRIDS; i++) {
+            table[i] = ' ';
+        }
+        turn = 'O';
+        pr_info("------- enter first ------");
+        queue_work(simrupt_workqueue, &player1);
+        pr_info("------- enter second ------");
+        queue_work(simrupt_workqueue, &player2);
     }
     tv_end = ktime_get();
 
@@ -350,12 +368,67 @@ static int simrupt_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
+static long device_ioctl(
+    struct file *file,      /* ditto */
+    unsigned int ioctl_num, /* number and param for ioctl */
+    unsigned long ioctl_param)
+{
+    int i;
+    long ret = SUCCESS;
+
+    /* We don't want to talk to two processes at the same time. */
+    if (atomic_cmpxchg(&already_open, CDEV_NOT_USED, CDEV_EXCLUSIVE_OPEN))
+        return -EBUSY;
+
+    /* Switch according to the ioctl called */
+    switch (ioctl_num) {
+    case IOCTL_SET_MSG: {
+        /* Receive a pointer to a message (in user space) and set that to
+         * be the device's message. Get the parameter given to ioctl by
+         * the process.
+         */
+        char __user *tmp = (char __user *) ioctl_param;
+        char ch;
+
+        /* Find the length of the message */
+        get_user(ch, tmp);
+        for (i = 0; ch && i < BUF_LEN; i++, tmp++) {
+            message[i] = ch;
+            get_user(ch, tmp);
+        }
+
+        break;
+    }
+    case IOCTL_GET_MSG: {
+        loff_t offset = 0;
+
+        /* Give the current message to the calling process - the parameter
+         * we got is a pointer, fill it.
+         */
+        simrupt_read(file, (char __user *) ioctl_param, 150, &offset);
+        break;
+    }
+    case IOCTL_GET_NTH_BYTE:
+        /* This ioctl is both input (ioctl_param) and output (the return
+         * value of this function).
+         */
+        ret = (long) message[ioctl_param];
+        break;
+    }
+
+    /* We're now ready for our next caller */
+    atomic_set(&already_open, CDEV_NOT_USED);
+
+    return ret;
+}
+
 static const struct file_operations simrupt_fops = {
     .read = simrupt_read,
     .llseek = no_llseek,
     .open = simrupt_open,
     .release = simrupt_release,
     .owner = THIS_MODULE,
+    .unlocked_ioctl = device_ioctl,
 };
 
 static int __init simrupt_init(void)
@@ -414,6 +487,7 @@ static int __init simrupt_init(void)
         table[i] = ' ';
     }
     turn = 'O';
+    message[0] = 0;
 
     pr_info("simrupt: registered new simrupt device: %d,%d\n", major, 0);
 out:
